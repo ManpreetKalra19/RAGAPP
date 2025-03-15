@@ -1,8 +1,7 @@
 import streamlit as st
 import os
 import tempfile
-import time
-from langchain_openai import OpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -52,10 +51,21 @@ def process_document(file_path, use_openai=True, api_key=None):
         if use_openai and api_key:
             os.environ["OPENAI_API_KEY"] = api_key
             embeddings = OpenAIEmbeddings()
-            llm = OpenAI(temperature=0, model_name="gpt-3.5-turbo")
+            llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
         else:
             # Use HuggingFace embeddings as a fallback
-            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            model_name = "sentence-transformers/all-MiniLM-L6-v2"
+            try:
+                embeddings = HuggingFaceEmbeddings(model_name=model_name)
+            except Exception as e:
+                st.error(f"Error loading HuggingFace embeddings: {str(e)}")
+                st.info("Falling back to OpenAI embeddings if possible")
+                if api_key:
+                    os.environ["OPENAI_API_KEY"] = api_key
+                    embeddings = OpenAIEmbeddings()
+                else:
+                    st.error("No OpenAI API key provided. Cannot proceed.")
+                    return None
             
             # If HuggingFace Hub API token is provided
             if st.session_state.get("hf_api_key"):
@@ -68,14 +78,16 @@ def process_document(file_path, use_openai=True, api_key=None):
                 # Use OpenAI with warning
                 if api_key:
                     os.environ["OPENAI_API_KEY"] = api_key
-                    llm = OpenAI(temperature=0, model_name="gpt-3.5-turbo")
+                    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
                 else:
                     st.error("No language model available. Please provide either an OpenAI or HuggingFace API key.")
                     return None
         
         # Try to create the vector store
         try:
+            st.info("Creating vector store... This may take a moment.")
             vectorstore = FAISS.from_documents(chunks, embeddings)
+            st.success("Vector store created successfully!")
         except Exception as e:
             logger.error(f"Error creating vector store: {e}")
             st.error(f"Error creating vector store: {str(e)}")
@@ -93,6 +105,7 @@ def process_document(file_path, use_openai=True, api_key=None):
             retriever=retriever,
             memory=memory,
             get_chat_history=lambda h: h,
+            verbose=True,
         )
         
         return conversation
@@ -101,6 +114,19 @@ def process_document(file_path, use_openai=True, api_key=None):
         logger.error(f"Error processing document: {e}")
         st.error(f"Error processing document: {str(e)}")
         return None
+
+# Streamlit secrets management - with safe fallback
+def get_api_key_from_secrets(key_name):
+    try:
+        if key_name in st.secrets:
+            return st.secrets[key_name]
+    except:
+        pass
+    return None
+
+# Check for API keys in Streamlit secrets (safely)
+openai_api_key_secret = get_api_key_from_secrets("openai_api_key")
+hf_api_key_secret = get_api_key_from_secrets("hf_api_key")
 
 # Sidebar for API key and document upload
 with st.sidebar:
@@ -111,11 +137,19 @@ with st.sidebar:
     tab1, tab2 = st.tabs(["OpenAI", "HuggingFace"])
     
     with tab1:
-        openai_api_key = st.text_input("OpenAI API Key", type="password")
+        openai_api_key = st.text_input(
+            "OpenAI API Key", 
+            value=openai_api_key_secret if openai_api_key_secret else "",
+            type="password"
+        )
         use_openai = st.checkbox("Use OpenAI for embeddings", value=True)
     
     with tab2:
-        hf_api_key = st.text_input("HuggingFace API Key (Optional)", type="password")
+        hf_api_key = st.text_input(
+            "HuggingFace API Key (Optional)", 
+            value=hf_api_key_secret if hf_api_key_secret else "",
+            type="password"
+        )
         if hf_api_key:
             st.session_state.hf_api_key = hf_api_key
     
@@ -125,15 +159,12 @@ with st.sidebar:
     
     if uploaded_file:
         with st.spinner("Processing document..."):
-            # Create a temporary file
             temp_dir = tempfile.TemporaryDirectory()
             temp_file_path = os.path.join(temp_dir.name, uploaded_file.name)
             
-            # Write the uploaded file to the temporary file
             with open(temp_file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
-            # Process the document
             conversation = process_document(
                 temp_file_path, 
                 use_openai=use_openai, 
@@ -150,20 +181,23 @@ with st.sidebar:
 # Main chat interface
 if st.session_state.document_loaded and st.session_state.conversation:
     st.header("Ask questions about your document")
+    st.info("Only ask questions related to the content of your document. The bot will decline to answer questions outside the document's scope.")
+    
     query = st.text_input("Ask a question:")
     
     if query:
         with st.spinner("Thinking..."):
             try:
-                # Get the response from the conversation chain
                 response = st.session_state.conversation.invoke({"question": query})
+                answer = response["answer"]
                 
-                # Store the conversation in the session state
-                st.session_state.chat_history.append((query, response["answer"]))
+                if "I don't know" in answer.lower() or "I cannot" in answer.lower():
+                    answer = "I can't answer that based on the document content. Please ask a question related to the document."
+                
+                st.session_state.chat_history.append((query, answer))
             except Exception as e:
                 st.error(f"Error processing your question: {str(e)}")
     
-    # Display the chat history
     for i, (query, response) in enumerate(st.session_state.chat_history):
         st.subheader(f"Question {i+1}: {query}")
         st.write(response)
@@ -172,5 +206,6 @@ if st.session_state.document_loaded and st.session_state.conversation:
 else:
     if not (openai_api_key or st.session_state.get("hf_api_key")):
         st.warning("Please enter at least one API key in the sidebar (OpenAI or HuggingFace).")
+        
     if not uploaded_file:
         st.info("Please upload a document in the sidebar to get started.")
