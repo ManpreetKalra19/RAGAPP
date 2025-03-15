@@ -1,10 +1,8 @@
 streamlit
 langchain
-langchain_openai
-langchain_community
-sentence-transformers
+langchain-openai
 faiss-cpu
-PyMuPDF  # For PDF processing (alternative to PyPDF)
-python-docx  # For DOCX processing
-huggingface_hub
-openai
+pypdf
+docx2txt
+huggingface-hub
+sentence-transformers
